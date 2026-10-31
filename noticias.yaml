@@ -1,0 +1,49 @@
+name: Noticias a Telegram
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # cada 15 minutos (hora UTC; GitHub a veces se atrasa unos minutos)
+  workflow_dispatch:         # botón "Run workflow" para correrlo a mano desde el iPhone
+    inputs:
+      modo:
+        description: "ronda = enviar noticias nuevas · probar = revisar fuentes sin enviar"
+        type: choice
+        options: [ronda, probar]
+        default: ronda
+
+permissions:
+  contents: write            # para guardar estado.json en el repositorio
+
+concurrency: noticias        # nunca dos rondas al mismo tiempo
+
+jobs:
+  ronda:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar librerías
+        run: pip install feedparser requests
+
+      - name: Revisar fuentes
+        if: github.event.inputs.modo == 'probar'
+        run: python noticias_telegram.py --probar
+
+      - name: Enviar noticias nuevas
+        if: github.event.inputs.modo != 'probar'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python noticias_telegram.py
+
+      - name: Guardar estado
+        run: |
+          git config user.name "bot-noticias"
+          git config user.email "bot-noticias@users.noreply.github.com"
+          git add estado.json
+          git diff --cached --quiet || (git commit -m "Actualiza estado" && git push)
