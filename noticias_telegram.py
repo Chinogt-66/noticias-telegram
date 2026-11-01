@@ -73,6 +73,9 @@ def cargar_config():
         "alertas_tendencia": op.get("alertas_tendencia", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
         "umbral_tendencia": int(op.get("umbral_tendencia", "3")),
         "ventana_horas": float(op.get("ventana_tendencia_horas", "6")),
+        "solo_hoy": op.get("solo_de_hoy", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
+        # Guatemala está en UTC-6 todo el año (no cambia de horario)
+        "utc_offset": float(op.get("utc_offset_horas", "-6")),
     }
 
 
@@ -359,6 +362,17 @@ def palabras_clave_titulo(titulo):
     return sorted({p for p in palabras if len(p) >= 4 and p not in PALABRAS_VACIAS})
 
 
+def es_de_hoy(e, cfg):
+    """True si la noticia se publicó hoy, según la hora de Guatemala.
+    Las que no traen fecha se descartan: no hay forma de saber si son viejas."""
+    publicada = fecha_entrada(e)
+    if not publicada:
+        return False
+    desfase = cfg["utc_offset"] * 3600
+    dia = lambda ts: time.strftime("%Y-%m-%d", time.gmtime(ts + desfase))
+    return dia(publicada) == dia(time.time())
+
+
 def misma_noticia(a, b):
     a, b = set(a), set(b)
     if not a or not b:
@@ -433,6 +447,9 @@ def ronda(cfg, fuentes, estado):
         elegidas = []
         descartadas = 0
         for e in nuevas:
+            if cfg["solo_hoy"] and not es_de_hoy(e, cfg):
+                descartadas += 1
+                continue
             if (cfg["solo_coyuntura"] and not es_coyuntura(e, clas)) or not pasa_filtro(cfg, e):
                 descartadas += 1
                 continue
