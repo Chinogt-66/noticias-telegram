@@ -1,18 +1,22 @@
-nombre,dominio,feed
-Prensa Libre,prensalibre.com,https://www.prensalibre.com/feed/
-La Hora,lahora.gt,
-Soy502,soy502.com,
-República,republica.gt,
-Plaza Pública,plazapublica.com.gt,
-Prensa Comunitaria,prensacomunitaria.org,
-AGN,agn.gt,
-Diario de Centro América,dca.gob.gt,
-Emisoras Unidas,emisorasunidas.com,https://emisorasunidas.com/feed/
-Guatevisión,guatevision.com,
-Azteca Guate,tvaztecaguate.com,
-Noti7,noti7.com.gt,
-Telediario,telediario.com.gt,
-Canal Antigua,canalantigua.tv,
-El Siglo,elsiglo.com.gt,
-La Red 106.1,lared.com.gt,
-TN23,tn23.tv,
+nombre,dominio,feed,ambito
+Prensa Libre,prensalibre.com,https://www.prensalibre.com/feed/,
+La Hora,lahora.gt,,
+Soy502,soy502.com,,
+República,republica.gt,,
+Plaza Pública,plazapublica.com.gt,,
+Prensa Comunitaria,prensacomunitaria.org,,
+AGN,agn.gt,,
+Diario de Centro América,dca.gob.gt,,
+Emisoras Unidas,emisorasunidas.com,https://emisorasunidas.com/feed/,
+Guatevisión,guatevision.com,,
+Azteca Guate,tvaztecaguate.com,,
+Noti7,noti7.com.gt,,
+Telediario,telediario.com.gt,,
+Canal Antigua,canalantigua.tv,,
+El Siglo,elsiglo.com.gt,,
+La Red 106.1,lared.com.gt,,
+TN23,tn23.tv,,
+BBC Mundo,bbc.com,https://feeds.bbci.co.uk/mundo/rss.xml,internacional
+DW Español,dw.com,https://rss.dw.com/xml/rss-sp-all,internacional
+France 24 Español,france24.com,https://www.france24.com/es/rss,internacional
+CNN en Español,cnnespanol.cnn.com,https://cnnespanol.cnn.com/feed/,internacional
