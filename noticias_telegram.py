@@ -17,6 +17,7 @@ TELEGRAM_TOKEN y TELEGRAM_CHAT_ID.
 """
 
 import argparse
+import calendar
 import configparser
 import csv
 import html
@@ -68,6 +69,10 @@ def cargar_config():
         "pausa": float(op.get("segundos_entre_mensajes", "3.5")),
         "vista_previa": op.get("vista_previa", "no").strip().lower() in ("si", "sí", "yes", "true", "1"),
         "palabras": [normalizar(p) for p in palabras],
+        "solo_coyuntura": op.get("solo_coyuntura", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
+        "alertas_tendencia": op.get("alertas_tendencia", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
+        "umbral_tendencia": int(op.get("umbral_tendencia", "3")),
+        "ventana_horas": float(op.get("ventana_tendencia_horas", "6")),
     }
 
 
@@ -87,6 +92,8 @@ def cargar_fuentes():
             "nombre": nombre,
             "dominio": (fila.get("dominio") or "").strip().removeprefix("https://").removeprefix("http://").strip("/"),
             "feed": (fila.get("feed") or "").strip(),
+            # opcional: nacional / internacional; vacío = decidir por el contenido
+            "ambito": normalizar((fila.get("ambito") or "").strip()),
         })
     return fuentes
 
@@ -178,7 +185,7 @@ def id_entrada(e):
 
 def fecha_entrada(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
-    return time.mktime(t) if t else 0
+    return calendar.timegm(t) if t else 0   # feedparser entrega la fecha en UTC
 
 
 # ---------------------------------------------------------------- telegram
@@ -227,6 +234,166 @@ def pasa_filtro(cfg, e):
     return any(p in texto for p in cfg["palabras"])
 
 
+# ---------------------------------------------------------------- clasificación
+#
+# Las listas de abajo son las de fábrica. Si existe clasificacion.ini junto al
+# script, sus listas reemplazan a estas (así se ajustan desde GitHub sin tocar
+# el código). Los términos se buscan al inicio de palabra, sin tildes:
+# "diputad" encuentra diputado, diputada y diputados.
+
+CLASIFICACION_BASE = {
+    "excluir": """deporte, futbol, fútbol, liga nacional, selección nacional, gol, partido amistoso,
+        mundial de clubes, champions, nba, nfl, béisbol, boxeo, tenis, atleta,
+        farándula, espectáculo, celebridad, famoso, actriz, actor, cantante, concierto,
+        telenovela, reality, serie de netflix, película, estreno, horóscopo, signo zodiacal,
+        receta, cocina, moda, belleza, maquillaje, mascota, viral, tiktok, meme,
+        lotería, sorteo, videojuego, gamer, iphone, android""",
+    "coyuntura": """congreso, diputad, ley, iniciativa de ley, reforma, presupuesto, gobierno, presidente,
+        presidencia, vicepresident, ministr, ministerio, secretar, gobernador, alcald, municipal,
+        mp, ministerio público, fiscal, fiscalía, juez, jueza, juzgado, tribunal, corte, cc, csj,
+        sentencia, juicio, audiencia, captura, detenid, orden de aprehensión, extradi, amparo,
+        tse, elección, electoral, partido político, candidat, voto, corrupción, plaza fantasma,
+        contralor, licitación, compra pública, impunidad, cicig, feci,
+        protesta, manifesta, bloqueo, paro, huelga, sindicato, autoridades indígenas, 48 cantones,
+        desalojo, conflictividad, comunidad, minería, hidroeléctrica, territorio,
+        derechos humanos, pdh, libertad de prensa, criminaliza,
+        migra, deportad, deportación, frontera, remesa, asilo, tps,
+        economía, económic, inflación, precio, canasta básica, combustible, gasolina, salario,
+        empleo, desempleo, banguat, banco de guatemala, impuesto, sat, arancel, exporta, importa,
+        pobreza, desnutrición, hambre, salud, hospital, igss, mspas, dengue, epidemia, vacuna,
+        educación, mineduc, maestro, magisterio,
+        seguridad, violencia, homicidio, asesinat, ataque armado, pandilla, extorsi,
+        narco, droga, crimen, cárcel, prisión, reos, pnc, policía, ejército, militar,
+        conred, sismo, terremoto, volcán, erupción, lluvia, tormenta, huracán, inundación,
+        deslave, emergencia, estado de calamidad, estado de sitio, sequía, incendio forestal,
+        guerra, conflicto armado, bombardeo, misil, alto el fuego, sanción, onu, oea,
+        cumbre, tratado, diplomátic, embajad, canciller, casa blanca, parlamento, golpe de estado""",
+    "nacional": """guatemala, guatemalteco, guatemalteca, chapín, ciudad de guatemala, mixco, villa nueva,
+        alta verapaz, baja verapaz, chimaltenango, chiquimula, el progreso, escuintla, huehuetenango,
+        izabal, jalapa, jutiapa, petén, quetzaltenango, xela, quiché, retalhuleu, sacatepéquez,
+        antigua guatemala, san marcos, santa rosa, sololá, suchitepéquez, totonicapán, zacapa,
+        congreso de la república, mp, ministerio público, tse, igss, pnc, conred, banguat, insivumeh,
+        mspas, mineduc, mingob, sat, pdh, cc, csj, 48 cantones""",
+    "internacional": """estados unidos, ee. uu., eeuu, eua, washington, casa blanca, méxico, mexicano,
+        el salvador, salvadoreñ, honduras, hondureñ, nicaragua, nicaragüense, costa rica, panamá,
+        belice, cuba, haití, república dominicana, venezuela, colombia, ecuador, perú, bolivia, chile,
+        argentina, brasil, uruguay, paraguay, canadá, españa, europa, unión europea, francia,
+        alemania, reino unido, italia, rusia, ucrania, china, japón, corea, india, israel, gaza,
+        palestin, irán, siria, líbano, onu, oea, otan, papa león, vaticano""",
+    "secciones_coyuntura": "politica, justicia, economia, nacional, nacionales, comunitario, guatemala, seguridad, gobierno",
+    "secciones_excluir": "deportes, deporte, futbol, escenario, entretenimiento, espectaculos, farandula, vida, estilo, viral, horoscopo, tecnologia, gastronomia, turismo",
+    "secciones_internacional": "internacional, internacionales, mundo, world, america-latina, latinoamerica",
+}
+
+PALABRAS_VACIAS = set("""a al ante bajo con contra de del desde durante en entre hacia hasta para por segun sin
+    sobre tras el la los las lo un una unos unas y o u e ni que se su sus le les es son fue ser ha han
+    este esta estos estas ese esa eso como mas pero ya no si muy tambien hoy ayer manana dice dicen
+    tras asi cual quien donde cuando todo todos toda todas otro otra nuevo nueva video fotos minuto
+    guatemala guatemalteco guatemalteca gt noticia noticias""".split())
+
+
+def _lista(texto):
+    return [normalizar(t.strip()) for t in re.split(r"[,\n]", texto) if t.strip()]
+
+
+def _patron(terminos):
+    partes = []
+    for t in terminos:
+        t = re.escape(t)
+        # Siglas cortas (mp, cc, sat) solo como palabra completa
+        partes.append(rf"\b{t}\b" if len(t) <= 3 else rf"\b{t}")
+    return re.compile("|".join(partes)) if partes else re.compile(r"(?!x)x")
+
+
+def cargar_clasificacion():
+    datos = dict(CLASIFICACION_BASE)
+    archivo = BASE / "clasificacion.ini"
+    if archivo.exists():
+        cp = configparser.ConfigParser()
+        cp.read(archivo, encoding="utf-8")
+        for seccion in cp.sections():
+            if "palabras" in cp[seccion] and seccion in datos:
+                datos[seccion] = cp[seccion]["palabras"]
+    patrones = {k: _patron(_lista(v)) for k, v in datos.items() if not k.startswith("secciones_")}
+    secciones = {k: set(_lista(v)) for k, v in datos.items() if k.startswith("secciones_")}
+    return patrones, secciones
+
+
+def secciones_de(enlace):
+    ruta = re.sub(r"^https?://[^/]+", "", enlace or "").lower()
+    return set(p for p in re.split(r"[/?#]", ruta) if p)
+
+
+def texto_de(e):
+    resumen = re.sub(r"<[^>]+>", " ", e.get("summary", ""))[:400]
+    return normalizar(html.unescape(e.get("title", "") + " " + resumen))
+
+
+def es_coyuntura(e, clas):
+    patrones, secciones = clas
+    partes_url = secciones_de(e.get("link"))
+    titulo = normalizar(html.unescape(e.get("title", "")))
+    if partes_url & secciones["secciones_excluir"] or patrones["excluir"].search(titulo):
+        return False
+    if partes_url & secciones["secciones_coyuntura"]:
+        return True
+    return bool(patrones["coyuntura"].search(texto_de(e)))
+
+
+def clasificar_ambito(e, fuente, clas):
+    if fuente.get("ambito") in ("nacional", "internacional"):
+        return fuente["ambito"]
+    patrones, secciones = clas
+    if secciones_de(e.get("link")) & secciones["secciones_internacional"]:
+        return "internacional"
+    texto = texto_de(e)
+    if patrones["nacional"].search(texto):
+        return "nacional"
+    if patrones["internacional"].search(texto):
+        return "internacional"
+    return "nacional"   # las fuentes son guatemaltecas: por defecto, nacional
+
+
+def palabras_clave_titulo(titulo):
+    palabras = re.findall(r"[a-z0-9]+", normalizar(html.unescape(titulo or "")))
+    return sorted({p for p in palabras if len(p) >= 4 and p not in PALABRAS_VACIAS})
+
+
+def misma_noticia(a, b):
+    a, b = set(a), set(b)
+    if not a or not b:
+        return False
+    comunes = len(a & b)
+    return comunes >= 4 or (comunes >= 2 and comunes / min(len(a), len(b)) >= 0.5)
+
+
+ETIQUETAS = {"nacional": "🇬🇹 <b>Nacional</b>", "internacional": "🌎 <b>Internacional</b>"}
+
+
+def formatear_clasificada(nombre, e, tipo, ambito):
+    titulo = html.unescape(e.get("title", "(sin título)")).strip()
+    if tipo == "google":
+        titulo = re.sub(r"\s+-\s+[^-]{2,60}$", "", titulo)
+    enlace = e.get("link", "")
+    return (f"{ETIQUETAS[ambito]} · {html.escape(nombre)}\n"
+            f"<a href=\"{html.escape(enlace, quote=True)}\">{html.escape(titulo)}</a>")
+
+
+def revisar_tendencia(cfg, entrada, ventana, alertas):
+    """Si varios medios distintos publican la misma noticia, manda una alerta (una sola vez)."""
+    parecidas = [v for v in ventana if misma_noticia(v["tok"], entrada["tok"])]
+    medios = list(dict.fromkeys(v["f"] for v in parecidas))
+    if len(medios) < cfg["umbral_tendencia"]:
+        return False
+    if any(misma_noticia(a["tok"], entrada["tok"]) for a in alertas):
+        return False
+    alertas.append({"t": time.time(), "tok": entrada["tok"]})
+    texto = (f"🔥 <b>TENDENCIA</b> · {ETIQUETAS[entrada['ambito']]} · {len(medios)} medios\n"
+             f"<a href=\"{html.escape(entrada['link'], quote=True)}\">{html.escape(entrada['titulo'])}</a>\n"
+             f"<i>{html.escape(', '.join(medios))}</i>")
+    return enviar(cfg, texto)
+
+
 # ---------------------------------------------------------------- rondas
 
 def obtener_feed(fuente, estado):
@@ -244,8 +411,13 @@ def obtener_feed(fuente, estado):
 
 
 def ronda(cfg, fuentes, estado):
+    clas = cargar_clasificacion()
     enviados_set = set(estado["enviados"])
-    total = 0
+    limite = time.time() - cfg["ventana_horas"] * 3600
+    ventana = [v for v in estado.get("ventana", []) if v["t"] >= limite]
+    alertas = [a for a in estado.get("alertas", []) if a["t"] >= limite]
+    total = tendencias = 0
+
     for f in fuentes:
         d, tipo = obtener_feed(f, estado)
         if not d:
@@ -258,26 +430,50 @@ def ronda(cfg, fuentes, estado):
         nuevas = [e for e in d.entries if id_entrada(e) not in vistos]
         nuevas.sort(key=fecha_entrada)
 
+        elegidas = []
+        descartadas = 0
+        for e in nuevas:
+            if (cfg["solo_coyuntura"] and not es_coyuntura(e, clas)) or not pasa_filtro(cfg, e):
+                descartadas += 1
+                continue
+            titulo = html.unescape(e.get("title", "")).strip()
+            if tipo == "google":
+                titulo = re.sub(r"\s+-\s+[^-]{2,60}$", "", titulo)
+            publicada = fecha_entrada(e) or time.time()
+            entrada = {"t": min(publicada, time.time()), "f": f["nombre"], "titulo": titulo,
+                       "link": e.get("link", ""), "tok": palabras_clave_titulo(titulo),
+                       "ambito": clasificar_ambito(e, f, clas)}
+            if entrada["t"] >= limite:   # lo viejo no cuenta para tendencias
+                ventana.append(entrada)
+            elegidas.append((e, entrada))
+
         if primera_vez:
             # No inundar el chat la primera vez: solo se marcan como vistas.
             print(f"- {f['nombre']}: primera lectura, {len(nuevas)} noticias marcadas como vistas")
         else:
-            por_enviar = [e for e in nuevas
-                          if pasa_filtro(cfg, e) and e.get("link") not in enviados_set]
-            for e in por_enviar[-cfg["max_por_fuente"]:]:
-                if enviar(cfg, formatear(f["nombre"], e, tipo)):
+            por_enviar = [(e, en) for e, en in elegidas if e.get("link") not in enviados_set]
+            for e, entrada in por_enviar[-cfg["max_por_fuente"]:]:
+                if enviar(cfg, formatear_clasificada(f["nombre"], e, tipo, entrada["ambito"])):
                     total += 1
                     enviados_set.add(e.get("link"))
                     estado["enviados"].append(e.get("link"))
                     time.sleep(cfg["pausa"])
+            if cfg["alertas_tendencia"]:
+                for _, entrada in elegidas:
+                    if revisar_tendencia(cfg, entrada, ventana, alertas):
+                        tendencias += 1
+                        time.sleep(cfg["pausa"])
             if nuevas:
-                print(f"- {f['nombre']}: {len(nuevas)} nuevas, {len(por_enviar)} pasan el filtro")
+                print(f"- {f['nombre']}: {len(nuevas)} nuevas, {len(por_enviar)} coyunturales, "
+                      f"{descartadas} descartadas")
 
+        estado["ventana"] = ventana
+        estado["alertas"] = alertas
         vistos.update(id_entrada(e) for e in d.entries)
         estado["vistos"][f["nombre"]] = list(vistos)[-MAX_VISTOS_POR_FUENTE:]
         estado["enviados"] = estado["enviados"][-MAX_ENLACES_GLOBALES:]
         guardar_estado(estado)
-    print(f"Ronda terminada: {total} mensajes enviados.")
+    print(f"Ronda terminada: {total} noticias y {tendencias} alertas de tendencia enviadas.")
 
 
 def probar(fuentes, estado):
