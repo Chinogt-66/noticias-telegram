@@ -76,6 +76,11 @@ def cargar_config():
         "solo_hoy": op.get("solo_de_hoy", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
         # Guatemala está en UTC-6 todo el año (no cambia de horario)
         "utc_offset": float(op.get("utc_offset_horas", "-6")),
+        # Resumen con IA: se activa solo si existe la variable ANTHROPIC_API_KEY
+        "clave_ia": os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        "usar_ia": op.get("resumen_ia", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
+        "modelo_ia": op.get("modelo_ia", "claude-haiku-5-5").strip(),
+        "imagen": op.get("imagen", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
     }
 
 
@@ -194,13 +199,26 @@ def fecha_entrada(e):
 # ---------------------------------------------------------------- telegram
 
 def enviar(cfg, texto):
-    url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
-    datos = {
+    return llamar_telegram(cfg, "sendMessage", {
         "chat_id": cfg["chat_id"],
         "text": texto,
         "parse_mode": "HTML",
         "disable_web_page_preview": not cfg["vista_previa"],
-    }
+    })
+
+
+def enviar_foto(cfg, imagen, leyenda):
+    """Manda la imagen con el texto como leyenda (Telegram acepta hasta 1024 caracteres)."""
+    return llamar_telegram(cfg, "sendPhoto", {
+        "chat_id": cfg["chat_id"],
+        "photo": imagen,
+        "caption": leyenda,
+        "parse_mode": "HTML",
+    }, silencioso=True)
+
+
+def llamar_telegram(cfg, metodo, datos, silencioso=False):
+    url = f"https://api.telegram.org/bot{cfg['token']}/{metodo}"
     for _ in range(4):
         try:
             r = SESION.post(url, data=datos, timeout=20)
@@ -214,7 +232,8 @@ def enviar(cfg, texto):
             time.sleep(espera + 1)
             continue
         if not r.ok:
-            print(f"  Telegram rechazó el mensaje: {r.text[:200]}")
+            if not silencioso:
+                print(f"  Telegram rechazó el mensaje: {r.text[:200]}")
             return False
         return True
     return False
@@ -393,6 +412,157 @@ def formatear_clasificada(nombre, e, tipo, ambito):
             f"<a href=\"{html.escape(enlace, quote=True)}\">{html.escape(titulo)}</a>")
 
 
+# ---------------------------------------------------------------- título y resumen
+
+def limpiar_html(texto):
+    texto = re.sub(r"(?is)<(script|style|noscript|figure|figcaption)[^>]*>.*?</\1>", " ", texto or "")
+    texto = re.sub(r"<[^>]+>", " ", texto)
+    return re.sub(r"\s+", " ", html.unescape(texto)).strip()
+
+
+_PAGINAS = {}
+
+
+def descargar_pagina(enlace):
+    """Baja el HTML de la nota una sola vez (lo usan el resumen y la imagen)."""
+    if not enlace or "news.google.com" in enlace:
+        return ""
+    if enlace not in _PAGINAS:
+        try:
+            r = SESION.get(enlace, timeout=15)
+            r.raise_for_status()
+            _PAGINAS[enlace] = r.text
+        except requests.RequestException:
+            _PAGINAS[enlace] = ""
+        if len(_PAGINAS) > 50:
+            _PAGINAS.pop(next(iter(_PAGINAS)))
+    return _PAGINAS[enlace]
+
+
+def imagen_de_la_nota(e):
+    """Busca la imagen que el medio publicó con la nota: primero en el feed, luego en la página."""
+    for campo in ("media_content", "media_thumbnail"):
+        for m in e.get(campo) or []:
+            url = m.get("url", "")
+            if url.startswith("http") and m.get("medium", "image") == "image":
+                return url
+    for enc in e.get("enclosures") or []:
+        if (enc.get("type") or "").startswith("image") and enc.get("href", "").startswith("http"):
+            return enc["href"]
+    for bloque in [e.get("summary", "")] + [c.get("value", "") for c in e.get("content") or []]:
+        m = re.search(r'<img[^>]+src=["\'](https?://[^"\']+)', bloque or "", re.I)
+        if m:
+            return html.unescape(m.group(1))
+    pagina = descargar_pagina(e.get("link", ""))
+    for prop in ("og:image", "twitter:image"):
+        m = (re.search(rf'<meta[^>]+(?:property|name)=["\']{prop}["\'][^>]+content=["\']([^"\']+)', pagina, re.I)
+             or re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{prop}["\']', pagina, re.I))
+        if m and m.group(1).startswith("http"):
+            return html.unescape(m.group(1))
+    return None
+
+
+def texto_de_la_nota(e):
+    """Intenta leer los párrafos de la nota; si no se puede, usa el resumen del feed."""
+    resumen_feed = limpiar_html(e.get("summary", ""))
+    pagina = descargar_pagina(e.get("link", ""))
+    if not pagina:
+        return resumen_feed
+    parrafos = [limpiar_html(p) for p in re.findall(r"(?is)<p[^>]*>(.*?)</p>", pagina)]
+    cuerpo = " ".join(p for p in parrafos if len(p) > 60)
+    return (cuerpo or resumen_feed)[:3500]
+
+
+def resumen_simple(e):
+    """Resumen gratis: las primeras dos frases que trae el feed."""
+    texto = limpiar_html(e.get("summary", ""))
+    texto = re.sub(r"\s*(The post|La entrada|Leer más|Seguir leyendo).*$", "", texto, flags=re.I)
+    frases = re.split(r"(?<=[.!?])\s+", texto)
+    resumen = " ".join(frases[:2]).strip()
+    return resumen[:320] + ("…" if len(resumen) > 320 else "")
+
+
+INSTRUCCIONES_IA = """Eres editor de un servicio de alertas de noticias para Guatemala.
+Recibes una nota periodística y devuelves SOLO un JSON con esta forma:
+{"titulo": "...", "resumen": ["...", "..."]}
+
+titulo: máximo 90 caracteres, en español, directo y atractivo, que invite a leer.
+Debe decir lo mismo que la nota: nada de exagerar, inventar cifras, opinar ni usar
+preguntas tipo carnada. Puede empezar con el dato más fuerte.
+
+resumen: entre 2 y 3 viñetas, cada una de una sola oración corta. Primero qué pasó,
+luego quién está involucrado y por qué importa o qué sigue. Usa datos concretos de
+la nota (nombres, cifras, lugares, fechas). Si la nota no da información suficiente,
+usa solo lo que sí está. No agregues nada que no esté en el texto."""
+
+
+def resumen_con_ia(cfg, titulo, medio, texto):
+    """Pide a Claude título y resumen. Devuelve (titulo, [viñetas]) o None si falla."""
+    cuerpo = {
+        "model": cfg["modelo_ia"],
+        "max_tokens": 600,
+        "system": INSTRUCCIONES_IA,
+        "messages": [{"role": "user", "content":
+                      f"Medio: {medio}\nTítulo original: {titulo}\n\nTexto de la nota:\n{texto or '(sin texto)'}"}],
+    }
+    try:
+        r = SESION.post("https://api.anthropic.com/v1/messages", json=cuerpo, timeout=60,
+                        headers={"x-api-key": cfg["clave_ia"], "anthropic-version": "2023-06-01"})
+        r.raise_for_status()
+        salida = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+        datos = json.loads(re.search(r"\{.*\}", salida, re.S).group(0))
+        nuevo = str(datos.get("titulo", "")).strip()
+        vinetas = [str(v).strip() for v in datos.get("resumen", []) if str(v).strip()][:3]
+        return (nuevo or titulo), vinetas
+    except Exception as err:   # si la IA falla, la nota igual se manda con el resumen simple
+        print(f"  IA no disponible para esta nota: {err}")
+        return None
+
+
+def titulo_y_resumen(cfg, nombre, e, entrada):
+    titulo, vinetas = entrada["titulo"], []
+    if cfg["usar_ia"] and cfg["clave_ia"]:
+        res = resumen_con_ia(cfg, titulo, nombre, texto_de_la_nota(e))
+        if res:
+            titulo, vinetas = res
+    if not vinetas:
+        simple = resumen_simple(e)
+        if simple and normalizar(simple[:60]) != normalizar(titulo[:60]):
+            vinetas = [simple]
+    return titulo, vinetas
+
+
+def armar_texto(nombre, entrada, titulo, vinetas, limite=4000):
+    """Arma el mensaje en HTML. Si no cabe en el límite, quita viñetas desde el final."""
+    vinetas = list(vinetas)
+    while True:
+        lineas = [f"{ETIQUETAS[entrada['ambito']]} · {html.escape(nombre)}",
+                  f"<b>{html.escape(titulo)}</b>"]
+        if vinetas:
+            lineas.append("")
+            lineas += [f"• {html.escape(v)}" for v in vinetas]
+        lineas.append(f"\n<a href=\"{html.escape(entrada['link'], quote=True)}\">Leer la nota completa</a>")
+        texto = "\n".join(lineas)
+        if len(texto) <= limite or not vinetas:
+            return texto
+        vinetas.pop()
+
+
+def construir_mensaje(cfg, nombre, e, entrada):
+    titulo, vinetas = titulo_y_resumen(cfg, nombre, e, entrada)
+    return armar_texto(nombre, entrada, titulo, vinetas)
+
+
+def publicar_nota(cfg, nombre, e, entrada):
+    """Manda la nota con su imagen si la hay; si la foto falla, la manda como texto."""
+    titulo, vinetas = titulo_y_resumen(cfg, nombre, e, entrada)
+    if cfg["imagen"]:
+        imagen = imagen_de_la_nota(e)
+        if imagen and enviar_foto(cfg, imagen, armar_texto(nombre, entrada, titulo, vinetas, 1024)):
+            return True
+    return enviar(cfg, armar_texto(nombre, entrada, titulo, vinetas))
+
+
 def revisar_tendencia(cfg, entrada, ventana, alertas):
     """Si varios medios distintos publican la misma noticia, manda una alerta (una sola vez)."""
     parecidas = [v for v in ventana if misma_noticia(v["tok"], entrada["tok"])]
@@ -470,7 +640,7 @@ def ronda(cfg, fuentes, estado):
         else:
             por_enviar = [(e, en) for e, en in elegidas if e.get("link") not in enviados_set]
             for e, entrada in por_enviar[-cfg["max_por_fuente"]:]:
-                if enviar(cfg, formatear_clasificada(f["nombre"], e, tipo, entrada["ambito"])):
+                if publicar_nota(cfg, f["nombre"], e, entrada):
                     total += 1
                     enviados_set.add(e.get("link"))
                     estado["enviados"].append(e.get("link"))
