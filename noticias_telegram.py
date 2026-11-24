@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Recopila noticias de los feeds RSS de medios guatemaltecos y las envía
-a un chat de Telegram.
+Recopila noticias y las envía a un chat o grupo de Telegram, solo como texto.
+
+Enfoque por defecto (enfoque = italia en config.ini):
+  - personas de nacionalidad italiana en Guatemala (seguridad, legal, migración,
+    política, economía, social, cultura)
+  - noticias que involucran a Guatemala e Italia
+Con enfoque = coyuntura vuelve al modo anterior (coyuntura nacional e internacional).
 
 Uso:
   python3 noticias_telegram.py                  una ronda (para cron)
@@ -67,8 +72,10 @@ def cargar_config():
         "intervalo": int(op.get("intervalo_minutos", "10")),
         "max_por_fuente": int(op.get("max_por_fuente_por_ronda", "8")),
         "pausa": float(op.get("segundos_entre_mensajes", "3.5")),
-        "vista_previa": op.get("vista_previa", "no").strip().lower() in ("si", "sí", "yes", "true", "1"),
         "palabras": [normalizar(p) for p in palabras],
+        # italia = comunidad italiana en Guatemala y relación Guatemala–Italia
+        # coyuntura = noticias de coyuntura nacional e internacional (modo anterior)
+        "enfoque": normalizar(op.get("enfoque", "italia").strip()) or "italia",
         "solo_coyuntura": op.get("solo_coyuntura", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
         "alertas_tendencia": op.get("alertas_tendencia", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
         "umbral_tendencia": int(op.get("umbral_tendencia", "3")),
@@ -80,7 +87,6 @@ def cargar_config():
         "clave_ia": os.environ.get("ANTHROPIC_API_KEY", "").strip(),
         "usar_ia": op.get("resumen_ia", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
         "modelo_ia": op.get("modelo_ia", "claude-haiku-5-5").strip(),
-        "imagen": op.get("imagen", "si").strip().lower() in ("si", "sí", "yes", "true", "1"),
     }
 
 
@@ -128,9 +134,15 @@ def normalizar(texto):
 
 # ---------------------------------------------------------------- feeds
 
-def url_google_news(consulta):
+EDICIONES_GOOGLE = {
+    "google": "&hl=es-419&gl=GT&ceid=GT:es-419",   # Google Noticias Guatemala, en español
+    "google-it": "&hl=it&gl=IT&ceid=IT:it",         # Google Noticias Italia, en italiano
+}
+
+
+def url_google_news(consulta, edicion="google"):
     return ("https://news.google.com/rss/search?q=" + quote_plus(consulta)
-            + "&hl=es-419&gl=GT&ceid=GT:es-419")
+            + EDICIONES_GOOGLE[edicion])
 
 
 def leer_feed(url):
@@ -164,9 +176,10 @@ def resolver_feed(fuente):
     """Encuentra un feed que funcione. Devuelve (url, tipo) o (None, None)."""
     feed, dom = fuente["feed"], fuente["dominio"]
 
-    if feed.startswith("google:"):
-        url = url_google_news(feed[len("google:"):].strip())
-        return (url, "google") if leer_feed(url) else (None, None)
+    for edicion in ("google-it", "google"):
+        if feed.startswith(edicion + ":"):
+            url = url_google_news(feed[len(edicion) + 1:].strip(), edicion)
+            return (url, "google") if leer_feed(url) else (None, None)
 
     candidatos = [feed] if feed else []
     if dom:
@@ -198,23 +211,22 @@ def fecha_entrada(e):
 
 # ---------------------------------------------------------------- telegram
 
+def destinos(cfg):
+    """TELEGRAM_CHAT_ID admite uno o varios chats separados por coma."""
+    return [c.strip() for c in str(cfg["chat_id"]).split(",") if c.strip()]
+
+
 def enviar(cfg, texto):
-    return llamar_telegram(cfg, "sendMessage", {
-        "chat_id": cfg["chat_id"],
-        "text": texto,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": not cfg["vista_previa"],
-    })
-
-
-def enviar_foto(cfg, imagen, leyenda):
-    """Manda la imagen con el texto como leyenda (Telegram acepta hasta 1024 caracteres)."""
-    return llamar_telegram(cfg, "sendPhoto", {
-        "chat_id": cfg["chat_id"],
-        "photo": imagen,
-        "caption": leyenda,
-        "parse_mode": "HTML",
-    }, silencioso=True)
+    """Manda solo texto, sin imagen y sin vista previa del enlace."""
+    ok = False
+    for chat in destinos(cfg):
+        ok = llamar_telegram(cfg, "sendMessage", {
+            "chat_id": chat,
+            "text": texto,
+            "parse_mode": "HTML",
+            "link_preview_options": json.dumps({"is_disabled": True}),
+        }) or ok
+    return ok
 
 
 def llamar_telegram(cfg, metodo, datos, silencioso=False):
@@ -232,6 +244,17 @@ def llamar_telegram(cfg, metodo, datos, silencioso=False):
             time.sleep(espera + 1)
             continue
         if not r.ok:
+            # Cuando un grupo se convierte en supergrupo, Telegram le cambia el ID
+            try:
+                nuevo_id = r.json().get("parameters", {}).get("migrate_to_chat_id")
+            except ValueError:
+                nuevo_id = None
+            if nuevo_id:
+                print(f"  ATENCIÓN: el grupo cambió de ID. Cambia el secreto TELEGRAM_CHAT_ID a {nuevo_id}")
+                viejo = str(datos.get("chat_id"))
+                cfg["chat_id"] = ",".join(str(nuevo_id) if c == viejo else c for c in destinos(cfg))
+                datos = dict(datos, chat_id=nuevo_id)
+                continue
             if not silencioso:
                 print(f"  Telegram rechazó el mensaje: {r.text[:200]}")
             return False
@@ -302,6 +325,55 @@ CLASIFICACION_BASE = {
         argentina, brasil, uruguay, paraguay, canadá, españa, europa, unión europea, francia,
         alemania, reino unido, italia, rusia, ucrania, china, japón, corea, india, israel, gaza,
         palestin, irán, siria, líbano, onu, oea, otan, papa león, vaticano""",
+    # ---- Enfoque Italia ----
+    # Cualquier mención de Italia o de italianos (en español y en italiano)
+    "italia": """italia, italian, italoguatemal, italo-guatemal, embajada de italia, embajador de italia,
+        consulado de italia, ambasciata, farnesina, connazional, cooperacion italiana, aics,
+        meloni, tajani, mattarella, guardia di finanza, carabinieri, ansa""",
+    # Conexión con Guatemala (en títulos de medios extranjeros)
+    "guatemala": """guatemal, ciudad de guatemala, antigua guatemala, peten, izabal, quetzaltenango, xela,
+        huehuetenango, solola, atitlan, alta verapaz, coban, escuintla, chiquimula, zacapa, jutiapa,
+        san marcos, quiche, totonicapan, retalhuleu, mazatenango, chimaltenango, mixco, villa nueva""",
+    # Personas italianas en Guatemala (comunidad, residentes, casos individuales)
+    "comunidad_italiana": """ciudadano italiano, ciudadana italiana, ciudadanos italianos, nacionalidad italiana,
+        origen italiano, origen italiana, italiano residente, italiana residente, residentes italianos,
+        empresario italiano, empresaria italiana, inversionista italiano, sacerdote italiano,
+        misionero italiano, misionera italiana, religiosa italiana, monja italiana, turista italian,
+        comunidad italiana, colectividad italiana, italoguatemal, connazional, cittadino italiano,
+        italiano arrestato, italiana arrestata, italiano detenido, italiana detenida, italiano capturado,
+        italiana capturada""",
+    # Relación entre Estados, gobiernos e instituciones
+    "bilateral": """embajada, embajador, ambasciat, consulado, consul general, canciller, minex, farnesina,
+        gobierno de italia, gobierno italiano, governo italiano, cooperacion italiana, cooperazione, aics,
+        bilateral, acuerdo, convenio, memorando, visita oficial, delegacion, ministro, ministra,
+        presidente, meloni, tajani, mattarella, donacion, donativo, exporta, importa, comercio,
+        inversion, union europea, instituto italiano, camara de comercio italiana, camara italiana,
+        escuela italiana, istituto italiano""",
+    # Temas (en este orden de prioridad)
+    "tema_seguridad": """captur, detenid, arrest, homicid, asesinat, ataque, secuestr, robo, asalt, extorsi,
+        narco, droga, cocaina, pandill, violencia, crimen, criminal, desaparecid, balead, ataque armado,
+        pnc, policia, ejercito, interpol, mafia, ndrangheta, camorra, rapina, omicidio, ucciso""",
+    "tema_legal": """juez, jueza, juzgado, tribunal, corte, sentencia, juicio, audiencia, mp, fiscal,
+        fiscalia, extradi, orden de captura, orden de aprehension, demanda, amparo, condena, proceso penal,
+        acusad, denuncia, ley, decreto, reglamento, tribunale, processo, condanna, estradizione""",
+    "tema_migracion": """visa, visado, pasaporte, consulado, consular, migracion, migratori, residencia,
+        nacionalidad, ciudadania, doble nacionalidad, deport, expuls, igm, voto en el exterior, aire,
+        cittadinanza, rimpatri""",
+    "tema_politica": """canciller, minex, gobierno, presidente, ministro,
+        ministra, congreso, diputad, diplomati, bilateral, visita oficial, acuerdo, convenio, eleccion,
+        parlamento, senado, governo""",
+    "tema_economia": """empresa, empresari, inversi, comercio, export, import, negocio, camara de comercio,
+        turismo, cafe, empleo, arancel, mercado, industria, banco, financ, impuesto, sat, economi,
+        aziend, investiment""",
+    "tema_social": """cooperaci, cooperazione, donaci, donativo, salud, hospital, educaci, escuela, comunidades,
+        iglesia, sacerdote, misioner, religios, parroquia, ong, voluntari, desastre, emergencia, damnificad,
+        pobreza, nutrici, ninez, mujeres, indigena""",
+    "tema_cultura": """cultur, festival, arte, artista, musica, cine, idioma, lengua italiana, beca,
+        universidad, patrimonio, arqueolog, exposicion, instituto italiano""",
+    # En el enfoque Italia solo se descarta deporte y entretenimiento sin relevancia
+    "excluir_italia": """deporte, futbol, serie a, calcio, champions, juventus, milan, napoli, ferrari,
+        formula 1, motogp, giro de italia, tenis, sinner, horoscopo, receta, pizza, lasagna, lasana,
+        loteria, videojuego, farandula, celebridad, reality""",
     "secciones_coyuntura": "politica, justicia, economia, nacional, nacionales, comunitario, guatemala, seguridad, gobierno",
     "secciones_excluir": "deportes, deporte, futbol, escenario, entretenimiento, espectaculos, farandula, vida, estilo, viral, horoscopo, tecnologia, gastronomia, turismo",
     "secciones_internacional": "internacional, internacionales, mundo, world, america-latina, latinoamerica",
@@ -400,7 +472,75 @@ def misma_noticia(a, b):
     return comunes >= 4 or (comunes >= 2 and comunes / min(len(a), len(b)) >= 0.5)
 
 
-ETIQUETAS = {"nacional": "🇬🇹 <b>Nacional</b>", "internacional": "🌎 <b>Internacional</b>"}
+ETIQUETAS = {
+    "nacional": "🇬🇹 <b>Nacional</b>",
+    "internacional": "🌎 <b>Internacional</b>",
+    "comunidad": "🇮🇹 <b>Italianos en Guatemala</b>",
+    "bilateral": "🇬🇹🇮🇹 <b>Guatemala–Italia</b>",
+}
+
+TEMAS = [   # (clave, etiqueta) en orden de prioridad
+    ("tema_seguridad", "🚨 Seguridad"),
+    ("tema_legal", "⚖️ Legal y justicia"),
+    ("tema_migracion", "🛂 Migración y consular"),
+    ("tema_politica", "🏛️ Política y diplomacia"),
+    ("tema_economia", "💼 Economía"),
+    ("tema_social", "🤝 Social"),
+    ("tema_cultura", "🎭 Cultura y educación"),
+]
+
+
+def dominio_de(url):
+    return re.sub(r"^www\.", "", re.sub(r"^https?://", "", url or "").split("/")[0].lower())
+
+
+def medio_de(e, fuente, tipo):
+    """Nombre del medio que publicó la nota. En Google Noticias es el medio original."""
+    if tipo == "google":
+        fuente_g = e.get("source") or {}
+        if fuente_g.get("title"):
+            return fuente_g["title"].strip()
+        m = re.search(r"\s+-\s+([^-]{2,60})$", html.unescape(e.get("title", "")))
+        if m:
+            return m.group(1).strip()
+    return fuente["nombre"]
+
+
+def es_medio_guatemalteco(e, fuente, tipo, dominios_gt):
+    if tipo == "google":
+        dom = dominio_de((e.get("source") or {}).get("href", ""))
+        return bool(dom) and (dom.endswith(".gt") or dom in dominios_gt)
+    return fuente.get("ambito") != "internacional"
+
+
+def relacion_con_italia(e, fuente, tipo, clas, dominios_gt):
+    """Devuelve 'comunidad', 'bilateral' o None si la nota no trata de Italia y Guatemala."""
+    patrones, secciones = clas
+    titulo = normalizar(html.unescape(e.get("title", "")))
+    texto = texto_de(e)
+    if not patrones["italia"].search(texto) or patrones["excluir_italia"].search(titulo):
+        return None
+    # Un medio guatemalteco hablando de un italiano casi siempre es un hecho en Guatemala,
+    # salvo que la nota esté en su sección internacional. Los medios extranjeros deben
+    # mencionar a Guatemala.
+    seccion_internacional = bool(secciones_de(e.get("link")) & secciones["secciones_internacional"])
+    guatemalteco = es_medio_guatemalteco(e, fuente, tipo, dominios_gt)
+    if not patrones["guatemala"].search(texto) and (not guatemalteco or seccion_internacional):
+        return None
+    if patrones["comunidad_italiana"].search(texto):
+        return "comunidad"
+    if patrones["bilateral"].search(texto):
+        return "bilateral"
+    return "comunidad" if re.search(r"\bitalian[oa]s?\b", texto) else "bilateral"
+
+
+def tema_de(e, clas, ambito=None):
+    patrones, _ = clas
+    texto = texto_de(e)
+    for clave, etiqueta in TEMAS:
+        if patrones[clave].search(texto):
+            return etiqueta
+    return "🏛️ Política y diplomacia" if ambito == "bilateral" else "📰 General"
 
 
 def formatear_clasificada(nombre, e, tipo, ambito):
@@ -439,29 +579,6 @@ def descargar_pagina(enlace):
     return _PAGINAS[enlace]
 
 
-def imagen_de_la_nota(e):
-    """Busca la imagen que el medio publicó con la nota: primero en el feed, luego en la página."""
-    for campo in ("media_content", "media_thumbnail"):
-        for m in e.get(campo) or []:
-            url = m.get("url", "")
-            if url.startswith("http") and m.get("medium", "image") == "image":
-                return url
-    for enc in e.get("enclosures") or []:
-        if (enc.get("type") or "").startswith("image") and enc.get("href", "").startswith("http"):
-            return enc["href"]
-    for bloque in [e.get("summary", "")] + [c.get("value", "") for c in e.get("content") or []]:
-        m = re.search(r'<img[^>]+src=["\'](https?://[^"\']+)', bloque or "", re.I)
-        if m:
-            return html.unescape(m.group(1))
-    pagina = descargar_pagina(e.get("link", ""))
-    for prop in ("og:image", "twitter:image"):
-        m = (re.search(rf'<meta[^>]+(?:property|name)=["\']{prop}["\'][^>]+content=["\']([^"\']+)', pagina, re.I)
-             or re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{prop}["\']', pagina, re.I))
-        if m and m.group(1).startswith("http"):
-            return html.unescape(m.group(1))
-    return None
-
-
 def texto_de_la_nota(e):
     """Intenta leer los párrafos de la nota; si no se puede, usa el resumen del feed."""
     resumen_feed = limpiar_html(e.get("summary", ""))
@@ -474,12 +591,15 @@ def texto_de_la_nota(e):
 
 
 def resumen_simple(e):
-    """Resumen gratis: las primeras dos frases que trae el feed."""
+    """Resumen gratis: la primera frase que trae el feed, corta."""
+    if "news.google.com" in e.get("link", ""):
+        return ""   # el "resumen" de Google Noticias solo repite el título
     texto = limpiar_html(e.get("summary", ""))
     texto = re.sub(r"\s*(The post|La entrada|Leer más|Seguir leyendo).*$", "", texto, flags=re.I)
-    frases = re.split(r"(?<=[.!?])\s+", texto)
-    resumen = " ".join(frases[:2]).strip()
-    return resumen[:320] + ("…" if len(resumen) > 320 else "")
+    resumen = re.split(r"(?<=[.!?])\s+", texto)[0].strip()
+    if len(resumen) > 180:
+        resumen = resumen[:180].rsplit(" ", 1)[0] + "…"
+    return resumen
 
 
 INSTRUCCIONES_IA = """Eres editor de un servicio de alertas de noticias para Guatemala.
@@ -490,17 +610,17 @@ titulo: máximo 90 caracteres, en español, directo y atractivo, que invite a le
 Debe decir lo mismo que la nota: nada de exagerar, inventar cifras, opinar ni usar
 preguntas tipo carnada. Puede empezar con el dato más fuerte.
 
-resumen: entre 2 y 3 viñetas, cada una de una sola oración corta. Primero qué pasó,
-luego quién está involucrado y por qué importa o qué sigue. Usa datos concretos de
-la nota (nombres, cifras, lugares, fechas). Si la nota no da información suficiente,
-usa solo lo que sí está. No agregues nada que no esté en el texto."""
+resumen: exactamente 2 viñetas, cada una de máximo 20 palabras. La primera dice qué
+pasó; la segunda, por qué importa o qué sigue. Usa datos concretos de la nota
+(nombres, cifras, lugares). Si la nota no da para dos, escribe una sola.
+No agregues nada que no esté en el texto."""
 
 
 def resumen_con_ia(cfg, titulo, medio, texto):
     """Pide a Claude título y resumen. Devuelve (titulo, [viñetas]) o None si falla."""
     cuerpo = {
         "model": cfg["modelo_ia"],
-        "max_tokens": 600,
+        "max_tokens": 400,
         "system": INSTRUCCIONES_IA,
         "messages": [{"role": "user", "content":
                       f"Medio: {medio}\nTítulo original: {titulo}\n\nTexto de la nota:\n{texto or '(sin texto)'}"}],
@@ -512,7 +632,7 @@ def resumen_con_ia(cfg, titulo, medio, texto):
         salida = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
         datos = json.loads(re.search(r"\{.*\}", salida, re.S).group(0))
         nuevo = str(datos.get("titulo", "")).strip()
-        vinetas = [str(v).strip() for v in datos.get("resumen", []) if str(v).strip()][:3]
+        vinetas = [str(v).strip() for v in datos.get("resumen", []) if str(v).strip()][:2]
         return (nuevo or titulo), vinetas
     except Exception as err:   # si la IA falla, la nota igual se manda con el resumen simple
         print(f"  IA no disponible para esta nota: {err}")
@@ -536,7 +656,10 @@ def armar_texto(nombre, entrada, titulo, vinetas, limite=4000):
     """Arma el mensaje en HTML. Si no cabe en el límite, quita viñetas desde el final."""
     vinetas = list(vinetas)
     while True:
-        lineas = [f"{ETIQUETAS[entrada['ambito']]} · {html.escape(nombre)}",
+        cabecera = ETIQUETAS[entrada["ambito"]]
+        if entrada.get("tema"):
+            cabecera += f" · {entrada['tema']}"
+        lineas = [f"{cabecera}\n<i>{html.escape(nombre)}</i>",
                   f"<b>{html.escape(titulo)}</b>"]
         if vinetas:
             lineas.append("")
@@ -554,12 +677,8 @@ def construir_mensaje(cfg, nombre, e, entrada):
 
 
 def publicar_nota(cfg, nombre, e, entrada):
-    """Manda la nota con su imagen si la hay; si la foto falla, la manda como texto."""
+    """Manda la nota como texto (sin imagen)."""
     titulo, vinetas = titulo_y_resumen(cfg, nombre, e, entrada)
-    if cfg["imagen"]:
-        imagen = imagen_de_la_nota(e)
-        if imagen and enviar_foto(cfg, imagen, armar_texto(nombre, entrada, titulo, vinetas, 1024)):
-            return True
     return enviar(cfg, armar_texto(nombre, entrada, titulo, vinetas))
 
 
@@ -596,10 +715,15 @@ def obtener_feed(fuente, estado):
 
 def ronda(cfg, fuentes, estado):
     clas = cargar_clasificacion()
+    enfoque_italia = cfg["enfoque"] == "italia"
+    dominios_gt = {f["dominio"].removeprefix("www.") for f in fuentes
+                   if f["dominio"] and f.get("ambito") != "internacional"}
     enviados_set = set(estado["enviados"])
     limite = time.time() - cfg["ventana_horas"] * 3600
     ventana = [v for v in estado.get("ventana", []) if v["t"] >= limite]
     alertas = [a for a in estado.get("alertas", []) if a["t"] >= limite]
+    # Títulos enviados en las últimas 48 h: la misma nota puede salir en varias búsquedas
+    titulos_enviados = [t for t in estado.get("titulos_enviados", []) if t["t"] >= time.time() - 48 * 3600]
     total = tendencias = 0
 
     for f in fuentes:
@@ -620,16 +744,28 @@ def ronda(cfg, fuentes, estado):
             if cfg["solo_hoy"] and not es_de_hoy(e, cfg):
                 descartadas += 1
                 continue
-            if (cfg["solo_coyuntura"] and not es_coyuntura(e, clas)) or not pasa_filtro(cfg, e):
+            if not pasa_filtro(cfg, e):
                 descartadas += 1
                 continue
+            tema = None
+            if enfoque_italia:
+                ambito = relacion_con_italia(e, f, tipo, clas, dominios_gt)
+                if not ambito:
+                    descartadas += 1
+                    continue
+                tema = tema_de(e, clas, ambito)
+            else:
+                if cfg["solo_coyuntura"] and not es_coyuntura(e, clas):
+                    descartadas += 1
+                    continue
+                ambito = clasificar_ambito(e, f, clas)
             titulo = html.unescape(e.get("title", "")).strip()
             if tipo == "google":
                 titulo = re.sub(r"\s+-\s+[^-]{2,60}$", "", titulo)
             publicada = fecha_entrada(e) or time.time()
-            entrada = {"t": min(publicada, time.time()), "f": f["nombre"], "titulo": titulo,
+            entrada = {"t": min(publicada, time.time()), "f": medio_de(e, f, tipo), "titulo": titulo,
                        "link": e.get("link", ""), "tok": palabras_clave_titulo(titulo),
-                       "ambito": clasificar_ambito(e, f, clas)}
+                       "ambito": ambito, "tema": tema}
             if entrada["t"] >= limite:   # lo viejo no cuenta para tendencias
                 ventana.append(entrada)
             elegidas.append((e, entrada))
@@ -640,10 +776,18 @@ def ronda(cfg, fuentes, estado):
         else:
             por_enviar = [(e, en) for e, en in elegidas if e.get("link") not in enviados_set]
             for e, entrada in por_enviar[-cfg["max_por_fuente"]:]:
-                if publicar_nota(cfg, f["nombre"], e, entrada):
+                repetida = any(t["titulo"] == normalizar(entrada["titulo"]) or
+                               (len(set(t["tok"]) & set(entrada["tok"])) >= 3 and
+                                len(set(t["tok"]) & set(entrada["tok"])) / max(1, min(len(t["tok"]), len(entrada["tok"]))) >= 0.75)
+                               for t in titulos_enviados)
+                if repetida:
+                    continue
+                if publicar_nota(cfg, entrada["f"], e, entrada):
                     total += 1
                     enviados_set.add(e.get("link"))
                     estado["enviados"].append(e.get("link"))
+                    titulos_enviados.append({"t": time.time(), "titulo": normalizar(entrada["titulo"]),
+                                             "tok": entrada["tok"]})
                     time.sleep(cfg["pausa"])
             if cfg["alertas_tendencia"]:
                 for _, entrada in elegidas:
@@ -651,11 +795,12 @@ def ronda(cfg, fuentes, estado):
                         tendencias += 1
                         time.sleep(cfg["pausa"])
             if nuevas:
-                print(f"- {f['nombre']}: {len(nuevas)} nuevas, {len(por_enviar)} coyunturales, "
+                print(f"- {f['nombre']}: {len(nuevas)} nuevas, {len(por_enviar)} relevantes, "
                       f"{descartadas} descartadas")
 
         estado["ventana"] = ventana
         estado["alertas"] = alertas
+        estado["titulos_enviados"] = titulos_enviados
         vistos.update(id_entrada(e) for e in d.entries)
         estado["vistos"][f["nombre"]] = list(vistos)[-MAX_VISTOS_POR_FUENTE:]
         estado["enviados"] = estado["enviados"][-MAX_ENLACES_GLOBALES:]
