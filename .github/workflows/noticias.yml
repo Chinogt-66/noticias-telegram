@@ -1,6 +1,6 @@
 {"name": "Noticias a Telegram",
 "on": {"schedule": [{"cron": "*/15 * * * *"}],
-"workflow_dispatch": {"inputs": {"modo": {"description": "ronda o probar", "type": "choice", "options": ["ronda", "probar"], "default": "ronda"}}}},
+"workflow_dispatch": {"inputs": {"modo": {"description": "ronda = enviar noticias, probar = revisar fuentes, prueba-telegram = mensaje de prueba al grupo", "type": "choice", "options": ["ronda", "probar", "prueba-telegram"], "default": "ronda"}}}},
 "permissions": {"contents": "write"},
 "concurrency": "noticias",
 "jobs": {"ronda": {"runs-on": "ubuntu-latest", "timeout-minutes": 15, "steps": [
@@ -8,6 +8,7 @@
 {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}},
 {"name": "Instalar librerias", "run": "pip install feedparser requests"},
 {"name": "Revisar fuentes", "if": "github.event.inputs.modo == 'probar'", "run": "python noticias_telegram.py --probar"},
-{"name": "Enviar noticias nuevas", "if": "github.event.inputs.modo != 'probar'", "env": {"TELEGRAM_TOKEN": "${{ secrets.TELEGRAM_TOKEN }}", "TELEGRAM_CHAT_ID": "${{ secrets.TELEGRAM_CHAT_ID }}", "ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}"}, "run": "python noticias_telegram.py"},
+{"name": "Mensaje de prueba", "if": "github.event.inputs.modo == 'prueba-telegram'", "env": {"TELEGRAM_TOKEN": "${{ secrets.TELEGRAM_TOKEN }}", "TELEGRAM_CHAT_ID": "${{ secrets.TELEGRAM_CHAT_ID }}"}, "run": "python noticias_telegram.py --prueba-telegram"},
+{"name": "Enviar noticias nuevas", "if": "github.event.inputs.modo != 'probar' && github.event.inputs.modo != 'prueba-telegram'", "env": {"TELEGRAM_TOKEN": "${{ secrets.TELEGRAM_TOKEN }}", "TELEGRAM_CHAT_ID": "${{ secrets.TELEGRAM_CHAT_ID }}", "ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}"}, "run": "python noticias_telegram.py"},
 {"name": "Guardar estado", "run": "git config user.name bot-noticias && git config user.email bot-noticias@users.noreply.github.com && git add estado.json && (git diff --cached --quiet || (git commit -m estado && git push))"}
 ]}}}
